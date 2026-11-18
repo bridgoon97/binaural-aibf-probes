@@ -1,0 +1,11 @@
+__pycache__/
+.venv/
+runs/
+demo_data/
+demo_delay/
+demo_bandwidth/
+data/
+*.pt
+*.npz
+*.wav
+.DS_Store

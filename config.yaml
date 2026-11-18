@@ -1,0 +1,64 @@
+# 双耳 AIBF 探针实验配置
+#
+# 口径约定
+# - 频率单位 Hz，时间单位 ms，码率单位 kbps，按 1000 bit/s 计算。
+# - 两个探针实验只改 message.delay_frames 与 message 的带宽字段。
+# - 其余字段在同一轮实验里固定，改动要记进实验记录。
+
+stft:
+  sample_rate: 16000
+  hop: 80            # 5 ms
+  win: 240           # 15 ms，3 个 hop 拼成
+  n_fft: 256         # 240 点末端零填充到 256
+  # 单边频点数 129，频点间隔 62.5 Hz，帧率 200 fps
+  # 前端算法延迟约等于窗长 15 ms，不含计算耗时
+
+bands:
+  # 低频逐 bin 恒等，高频三角带，仿 AIBF 的 256 到 128 做法
+  n_linear: 32       # bin 0 到 31，即 0 到 1937.5 Hz
+  n_tri: 32          # bin 32 到 128
+  # 合计 64 带
+
+local:
+  n_mic: 1           # 每侧麦数，首版 1
+
+message:
+  enabled: true          # false 为严格无通信基线，保持网络尺寸
+  # 探针实验二：带宽。改 payload、band_range、n_msg_bands、bits_*、update_period
+  payload: complex       # complex 送幅度与相位，logmag 只送幅度
+  band_range: [0, 1000]  # 消息覆盖的频率范围
+  n_msg_bands: 8         # band_range 内的消息频带数
+  bits_mag: 4
+  bits_phase: 4
+  mag_range_db: [-60, 20]
+  update_period: 4       # 每 N 帧发一条消息，4 帧即 50 条每秒
+
+  # 探针实验一：延迟。只改这一项
+  delay_frames: 4        # 单向延迟帧数，4 帧即 20 ms
+
+  # 以下不属于两个探针实验，默认关闭
+  sync_error_us: 0.0     # 恒定耳间同步偏移，注入到对耳相位
+  header_bits: 32        # 仅用于应用层码率核算，不进网络
+
+crf:
+  use_local_logmag: true   # 当前帧本侧对数幅度谱
+  use_cross_ipd: true      # 历史帧本侧与对侧的相位差
+  use_cross_ild: true      # 历史帧本侧与对侧的电平差
+  use_age_feature: true    # 消息年龄与有效位
+  hidden: 128
+  groups: 2
+  tap_stride: 4           # 固定墙钟抽头间隔，不随更新周期变化
+  age_scale_frames: 20    # 年龄归一化尺度，各延迟档固定
+  n_taps: 3                # 因果复数 FIR 阶数
+  # 抽头读取历史时刻实际持有的消息，重复消息允许重复使用
+
+scm:
+  local_frame: delayed     # delayed 表示与对耳同时间戳配对，current 表示不配对
+  instance_norm: true
+
+mvdr:
+  gain_limit: 2.0
+  use_current_spec: true   # 把当前帧本侧复数谱并进逐带估计器输入
+  hidden: 64
+  groups: 2
+  n_layers: 2
