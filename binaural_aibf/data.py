@@ -37,8 +37,10 @@ def check_splits(*splits):
                 overlap = {r[key] for r in left} & {r[key] for r in right}
                 if overlap:
                     raise ValueError(f"集合泄漏：{key} 重复 {sorted(overlap)[:3]}")
+
             def paths(rows):
                 return {r[k] for r in rows for k in ("npz", "mixture", "target") if k in r}
+
             if paths(left) & paths(right):
                 raise ValueError("集合泄漏：音频路径重复")
 
@@ -70,7 +72,10 @@ def load_example(row, sample_rate):
         raise ValueError(f"{row['id']} 含非有限值")
     if max(np.abs(mix).max(), np.abs(target).max()) > 1.0001:
         raise ValueError(f"{row['id']} 幅度超出 [-1, 1]，请对双耳混合与目标使用共同缩放")
-    return torch.from_numpy(mix.astype(np.float32).copy()), torch.from_numpy(target.astype(np.float32).copy())
+    return (
+        torch.from_numpy(mix.astype(np.float32).copy()),
+        torch.from_numpy(target.astype(np.float32).copy()),
+    )
 
 
 def validate_manifest(rows, sample_rate):
@@ -78,4 +83,4 @@ def validate_manifest(rows, sample_rate):
     for row in rows:
         x, _ = load_example(row, sample_rate)
         samples += x.shape[-1]
-    return {"条目": len(rows), "场景组": len({r['group'] for r in rows}), "秒数": samples / sample_rate}
+    return {"条目": len(rows), "场景组": len({r["group"] for r in rows}), "秒数": samples / sample_rate}

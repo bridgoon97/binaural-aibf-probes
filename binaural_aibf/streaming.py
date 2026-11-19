@@ -1,12 +1,7 @@
-"""单帧流式网络构造与导出。
+"""单帧流式网络构造与导出（支持 n_mic >= 1）。
 
-训练阶段使用 BinauralAIBF 全序列并行前向与反向（基于延迟抽头拼接与融合 GroupedGRU）。
-导出与实时部署阶段使用本模块按单帧流式构造网络：
-- StreamingSideModel：单侧单帧纯张量网络，内部使用 GroupedGRUCell 与显式状态输入/输出，
-  无动态控制流与时间循环，可直接导出为 TorchScript 或 ONNX。
-- BinauralStreamingRunner：带跨耳延迟队列与本侧历史缓存的双耳流式运行器，
-  支持直接驱动 StreamingSideModel、TorchScript 模块或 ONNXRuntime 会话，
-  并可与并行训练模型做逐帧/逐样本数值等价校验。
+- StreamingSideModel：单侧单帧纯张量网络，无动态控制流与时间循环，支持 TorchScript 与 ONNX。
+- BinauralStreamingRunner：带跨耳延迟队列与本侧历史缓存的双耳逐帧流式运行器。
 """
 
 from collections import deque
@@ -17,32 +12,16 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
-from bands import compress_complex, expand_complex
-from complexops import cabs, cmul_conj
-from features import build_crf_input_step
+from .bands import compress_band, expand_complex, pad_dc_zero, strip_dc
+from .complexops import cabs, cmul_conj
+from .features import build_crf_input_step, compress_current_spec
 
 
 class StreamingSideModel(nn.Module):
     """按流式单帧构造的单耳核心网络，可直接导出为 TorchScript / ONNX。
 
-    输入张量（全部以 batch 维 B 为第 0 维）：
-    - local_bin          [B, n_bins, 2]                     当前帧本侧复数谱
-    - local_band_matched [B, n_bands, 2]                    与当前持有对耳消息同时间戳的本侧频带谱
-    - remote_band        [B, n_bands, 2]                    当前帧持有的解码对耳频带谱
-    - valid              [B, 1]                             当前帧是否已收到过有效对耳消息（0/1）
-    - age_frames         [B, 1]                             当前持有消息的年龄（帧）
-    - pair_hist          [B, 2, buf_len, n_bands, 2]        历史通道配对缓存（buf_len = max((n_taps-1)*tap_stride, 1)）
-    - crf_h1             [B, crf_hidden]                    CRF 第一层分组 GRU 状态
-    - crf_h2             [B, crf_hidden]                    CRF 第二层分组 GRU 状态
-    - mvdr_h             [B, n_mvdr_layers, n_bands, mvdr_hidden]  MVDR 各层各频带 GRU 状态
-
-    输出张量：
-    - out_bin            [B, n_bins, 2]                     当前帧本侧增强复数谱
-    - local_band_now     [B, n_bands, 2]                    当前帧本侧频带谱（供外层缓存与跨耳发送）
-    - next_pair_hist     [B, 2, buf_len, n_bands, 2]        更新后的历史通道配对缓存
-    - next_crf_h1        [B, crf_hidden]
-    - next_crf_h2        [B, crf_hidden]
-    - next_mvdr_h        [B, n_mvdr_layers, n_bands, mvdr_hidden]
+    n_mic=1 时 local_bin 为 [B, n_bins, 2]、local_band_* 为 [B, n_bands, 2]；
+    n_mic>1 时 local_bin 为 [B, n_mic, n_bins, 2]、local_band_* 为 [B, n_mic, n_bands, 2]。
     """
 
     INPUT_NAMES = (
@@ -68,8 +47,11 @@ class StreamingSideModel(nn.Module):
     def __init__(self, train_model):
         super().__init__()
         self.cfg = train_model.cfg
-        self.n_bins = train_model.stft.n_bins
+        self.n_bins = train_model.n_bins
+        self.n_linear = train_model.n_linear
         self.n_bands = train_model.n_bands
+        self.n_mic = train_model.n_mic
+        self.n_ch = train_model.n_ch
         self.n_taps = train_model.n_taps
         self.tap_stride = train_model.tap_stride
         self.hist_len = (self.n_taps - 1) * self.tap_stride
@@ -77,6 +59,8 @@ class StreamingSideModel(nn.Module):
         self.local_frame = self.cfg["scm"]["local_frame"]
         self.payload = self.cfg["message"]["payload"]
         self.use_current_spec = bool(self.cfg["mvdr"]["use_current_spec"])
+        self.normalize_current_spec = train_model.normalize_current_spec
+        self.current_spec_power = train_model.current_spec_power
         self.gain_limit = float(self.cfg["mvdr"].get("gain_limit", 2.0))
         self.crf_hidden = int(self.cfg["crf"]["hidden"])
         self.mvdr_hidden = int(self.cfg["mvdr"]["hidden"])
@@ -90,8 +74,19 @@ class StreamingSideModel(nn.Module):
                 device=train_model.comp.device, dtype=train_model.comp.dtype
             ),
         )
+        self.register_buffer(
+            "valid_band_phase",
+            train_model.msg.valid_band_phase.detach().clone().to(
+                device=train_model.comp.device, dtype=train_model.comp.dtype
+            ),
+        )
+        self.register_buffer(
+            "mag_only_band",
+            train_model.msg.mag_only_band.detach().clone().to(
+                device=train_model.comp.device, dtype=train_model.comp.dtype
+            ),
+        )
 
-        # 按单帧流式组件构造并精确同步训练权重。
         self.crf = train_model.crf.to_streaming()
         self.scm = train_model.scm.to_streaming()
         self.mvdr = train_model.mvdr.to_streaming()
@@ -105,7 +100,7 @@ class StreamingSideModel(nn.Module):
         if dtype is None:
             dtype = self.comp.dtype
         pair_hist = torch.zeros(
-            batch_size, 2, self.buf_len, self.n_bands, 2, device=device, dtype=dtype
+            batch_size, self.n_ch, self.buf_len, self.n_bands, 2, device=device, dtype=dtype
         )
         crf_h1 = torch.zeros(batch_size, self.crf_hidden, device=device, dtype=dtype)
         crf_h2 = torch.zeros(batch_size, self.crf_hidden, device=device, dtype=dtype)
@@ -126,10 +121,18 @@ class StreamingSideModel(nn.Module):
             device = self.comp.device
         if dtype is None:
             dtype = self.comp.dtype
-        local_bin = torch.zeros(batch_size, self.n_bins, 2, device=device, dtype=dtype)
-        local_band_matched = torch.zeros(
-            batch_size, self.n_bands, 2, device=device, dtype=dtype
-        )
+        if self.n_mic == 1:
+            local_bin = torch.zeros(batch_size, self.n_bins, 2, device=device, dtype=dtype)
+            local_band_matched = torch.zeros(
+                batch_size, self.n_bands, 2, device=device, dtype=dtype
+            )
+        else:
+            local_bin = torch.zeros(
+                batch_size, self.n_mic, self.n_bins, 2, device=device, dtype=dtype
+            )
+            local_band_matched = torch.zeros(
+                batch_size, self.n_mic, self.n_bands, 2, device=device, dtype=dtype
+            )
         remote_band = torch.zeros(
             batch_size, self.n_bands, 2, device=device, dtype=dtype
         )
@@ -162,24 +165,29 @@ class StreamingSideModel(nn.Module):
         crf_h2: torch.Tensor,
         mvdr_h: torch.Tensor,
     ):
-        local_band_now = compress_complex(local_bin, self.comp)
-        if self.local_frame == "delayed":
-            local_matched = local_band_matched
+        local_band_now = compress_band(local_bin, self.comp, self.n_linear)
+        if self.n_mic == 1:
+            local_bin_m = local_bin.unsqueeze(1)
+            local_band_m = local_band_now.unsqueeze(1)
+            matched_raw = local_band_matched if self.local_frame == "delayed" else local_band_now
+            matched_m = matched_raw.unsqueeze(1)
         else:
-            local_matched = local_band_now
+            local_bin_m = local_bin
+            local_band_m = local_band_now
+            matched_m = local_band_matched if self.local_frame == "delayed" else local_band_now
 
         feat = build_crf_input_step(
             self.cfg,
-            local_band_now=local_band_now,
-            local_band_matched=local_matched,
+            local_band_now=local_band_m[:, 0],
+            local_band_matched=matched_m[:, 0],
             remote_band=remote_band,
             valid=valid,
             age_frames=age_frames,
             valid_band=self.valid_band,
+            valid_band_phase=self.valid_band_phase,
         )
 
-        # 当前帧通道对 [B, 2, n_bands, 2]，推入历史缓存并按固定墙钟步长取抽头。
-        pair_now = torch.stack([local_matched, remote_band], dim=1)
+        pair_now = torch.cat([matched_m, remote_band.unsqueeze(1)], dim=1)
         if self.n_taps == 1:
             chan_taps = pair_now.unsqueeze(2)
             next_pair_hist = pair_hist
@@ -192,17 +200,40 @@ class StreamingSideModel(nn.Module):
             chan_taps = torch.stack(
                 [cabs(chan_taps), torch.zeros_like(chan_taps[..., 0])], dim=-1
             )
+        elif self.payload == "mixed":
+            mag_only = self.mag_only_band.view(1, 1, 1, self.n_bands, 1)
+            mag_only_chan = torch.stack(
+                [cabs(chan_taps), torch.zeros_like(chan_taps[..., 0])], dim=-1
+            )
+            chan_taps = torch.where(mag_only > 0.5, mag_only_chan, chan_taps)
 
-        fir, next_crf_h1, next_crf_h2 = self.crf(feat, crf_h1, crf_h2)
+        if self.mvdr.film_bridge is not None:
+            fir, next_crf_h1, next_crf_h2, crf_h = self.crf.forward_with_hidden(
+                feat, crf_h1, crf_h2
+            )
+        else:
+            fir, next_crf_h1, next_crf_h2 = self.crf(feat, crf_h1, crf_h2)
+            crf_h = None
+
         scm = self.scm(chan_taps, fir)
         if self.use_current_spec:
-            scm = torch.cat([scm, local_band_now], dim=-1)
-        g_band, next_mvdr_h = self.mvdr(scm, mvdr_h)
+            cur = (
+                compress_current_spec(local_band_m, self.current_spec_power, has_mic_dim=True)
+                if self.normalize_current_spec
+                else local_band_m
+            )
+            cur_flat = cur.transpose(1, 2).reshape(-1, self.n_bands, 2 * self.n_mic)
+            scm = torch.cat([scm, cur_flat], dim=-1)
 
+        g_band_flat, next_mvdr_h = self.mvdr(
+            scm, mvdr_h, crf_h=crf_h, age_frames=age_frames, valid=valid
+        )
+        g_band = g_band_flat.reshape(-1, self.n_bands, self.n_mic, 2).transpose(1, 2)
         g_bin = expand_complex(g_band, self.expa)
-        scale = (self.gain_limit / cabs(g_bin).clamp_min(1e-8)).clamp_max(1.0)
-        g_bin = g_bin * scale.unsqueeze(-1)
-        out_bin = cmul_conj(local_bin, g_bin)
+        norm = torch.sqrt(g_bin.square().sum(dim=(1, 3), keepdim=True) + 1e-8)
+        scale = (self.gain_limit / norm.clamp_min(1e-8)).clamp_max(1.0)
+        g_bin = g_bin * scale
+        out_bin = cmul_conj(local_bin_m, g_bin).sum(dim=1)
         return (
             out_bin,
             local_band_now,
@@ -227,11 +258,7 @@ class _SideRuntime:
 
 
 class BinauralStreamingRunner:
-    """双耳逐帧流式运行器。
-
-    左耳与右耳共享同一个单帧流式网络（StreamingSideModel / TorchScript / ONNXRuntime），
-    各自维护独立的隐状态、本侧频带历史缓存与跨耳延迟交付队列。
-    """
+    """双耳逐帧流式运行器（支持 n_mic >= 1）。"""
 
     def __init__(
         self,
@@ -243,6 +270,9 @@ class BinauralStreamingRunner:
         self.msg = train_model.msg
         self.communication = train_model.communication
         self.local_frame = self.cfg["scm"]["local_frame"]
+        self.n_mic = train_model.n_mic
+        self.n_bins = train_model.n_bins
+        self.n_linear = train_model.n_linear
         self.comp = train_model.comp.detach().clone()
         self.streaming_model = train_model.build_streaming_model()
         self.step_fn = self.streaming_model if step_fn is None else step_fn
@@ -296,7 +326,6 @@ class BinauralStreamingRunner:
                 rt.held_remote = decoded
                 rt.held_emit = emit_idx
                 rt.has_valid = True
-                # 释放早于当前已交付时间戳的本侧历史帧，保持常数内存占用。
                 stale = [k for k in rt.local_hist if k < rt.held_emit]
                 for k in stale:
                     del rt.local_hist[k]
@@ -311,14 +340,14 @@ class BinauralStreamingRunner:
                     else local_band_now
                 )
             else:
-                remote_band = torch.zeros_like(local_band_now)
+                remote_band = torch.zeros_like(remote_band_now)
                 valid = torch.zeros(b, 1, device=device, dtype=dtype)
                 age = torch.full((b, 1), float(t), device=device, dtype=dtype)
                 local_matched = (
                     rt.local_hist[0] if self.local_frame == "delayed" else local_band_now
                 )
         else:
-            remote_band = torch.zeros_like(local_band_now)
+            remote_band = torch.zeros_like(remote_band_now)
             valid = torch.zeros(b, 1, device=device, dtype=dtype)
             age = torch.zeros(b, 1, device=device, dtype=dtype)
             local_matched = local_band_now
@@ -348,7 +377,10 @@ class BinauralStreamingRunner:
     def step_spec(
         self, local_bin_l: torch.Tensor, local_bin_r: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """双耳单帧频谱流式推进。输入均为 [B, n_bins, 2]。"""
+        """双耳单帧频谱流式推进。"""
+        if self.n_mic == 1 and local_bin_l.dim() == 4:
+            local_bin_l = local_bin_l.squeeze(1)
+            local_bin_r = local_bin_r.squeeze(1)
         if self.left is None or self.right is None:
             self.reset(
                 batch_size=local_bin_l.shape[0],
@@ -356,11 +388,13 @@ class BinauralStreamingRunner:
                 dtype=local_bin_l.dtype,
             )
         comp = self.comp.to(device=local_bin_l.device, dtype=local_bin_l.dtype)
-        bl = compress_complex(local_bin_l, comp)
-        br = compress_complex(local_bin_r, comp)
+        bl = compress_band(local_bin_l, comp, self.n_linear)
+        br = compress_band(local_bin_r, comp, self.n_linear)
+        ref_bl = bl if self.n_mic == 1 else bl[:, 0]
+        ref_br = br if self.n_mic == 1 else br[:, 0]
         t = self.frame_idx
-        out_l = self._step_one_side(self.left, local_bin_l, bl, br, t)
-        out_r = self._step_one_side(self.right, local_bin_r, br, bl, t)
+        out_l = self._step_one_side(self.left, local_bin_l, bl, ref_br, t)
+        out_r = self._step_one_side(self.right, local_bin_r, br, ref_bl, t)
         self.frame_idx += 1
         return out_l, out_r
 
@@ -368,7 +402,6 @@ class BinauralStreamingRunner:
     def process_spec(
         self, xl: torch.Tensor, xr: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """逐帧调用单帧流式网络处理整段双耳频谱 [B, T, n_bins, 2]。"""
         self.reset(batch_size=xl.shape[0], device=xl.device, dtype=xl.dtype)
         outs_l, outs_r = [], []
         for t in range(xl.shape[1]):
@@ -381,32 +414,47 @@ class BinauralStreamingRunner:
     def process_waveform(
         self, wav_left: torch.Tensor, wav_right: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """用单帧流式网络处理整段双耳波形 [B, S]，便于与并行模型做等价验证。"""
         if wav_left.shape != wav_right.shape:
-            raise ValueError("左右波形必须等长")
-        xl = self.stft.analyze(wav_left)
-        xr = self.stft.analyze(wav_right)
+            raise ValueError("左右波形必须同形状")
+        if wav_left.dim() == 2:
+            if self.n_mic != 1:
+                raise ValueError(f"n_mic={self.n_mic} 时输入波形必须为 [B, n_mic, S]")
+            wl, wr = wav_left.unsqueeze(1), wav_right.unsqueeze(1)
+        elif wav_left.dim() == 3:
+            if wav_left.shape[1] != self.n_mic:
+                raise ValueError(f"输入通道数 {wav_left.shape[1]} 与 n_mic={self.n_mic} 不一致")
+            wl, wr = wav_left, wav_right
+        else:
+            raise ValueError("波形维度必须为 [B, S] 或 [B, n_mic, S]")
+
+        b, m, n = wl.shape
+        xl_flat = strip_dc(self.stft.analyze(wl.reshape(b * m, n)))
+        xr_flat = strip_dc(self.stft.analyze(wr.reshape(b * m, n)))
+        t = xl_flat.shape[1]
+        xl = xl_flat.reshape(b, m, t, self.n_bins, 2).transpose(1, 2)
+        xr = xr_flat.reshape(b, m, t, self.n_bins, 2).transpose(1, 2)
+        if self.n_mic == 1:
+            xl, xr = xl.squeeze(2), xr.squeeze(2)
         yl_spec, yr_spec = self.process_spec(xl, xr)
-        n = wav_left.shape[1]
         return (
-            self.stft.synthesize(yl_spec, length=n),
-            self.stft.synthesize(yr_spec, length=n),
+            self.stft.synthesize(pad_dc_zero(yl_spec), length=n),
+            self.stft.synthesize(pad_dc_zero(yr_spec), length=n),
         )
 
 
 def make_onnxruntime_step_fn(onnx_path: str | Path):
     """把导出的单帧 ONNX 模型包装成可供 BinauralStreamingRunner 调用的 step_fn。"""
-    import onnxruntime as ort
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise ImportError("需要安装 onnxruntime 才能运行 ONNX 流式校验") from exc
 
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     in_names = list(StreamingSideModel.INPUT_NAMES)
 
     def _step(*tensors: torch.Tensor):
         device, dtype = tensors[0].device, tensors[0].dtype
-        feed = {
-            name: t.detach().cpu().numpy()
-            for name, t in zip(in_names, tensors)
-        }
+        feed = {name: t.detach().cpu().numpy() for name, t in zip(in_names, tensors)}
         outs = sess.run(None, feed)
         return tuple(torch.from_numpy(arr).to(device=device, dtype=dtype) for arr in outs)
 
@@ -429,8 +477,13 @@ def verify_streaming_equivalence(
         dtype = train_model.comp.dtype
         n_samples = max(1, int(seconds * train_model.stft.sample_rate))
         gen = torch.Generator(device="cpu").manual_seed(42)
-        xl = torch.randn(batch_size, n_samples, generator=gen, dtype=dtype).to(device)
-        xr = torch.randn(batch_size, n_samples, generator=gen, dtype=dtype).to(device)
+        shape = (
+            (batch_size, n_samples)
+            if train_model.n_mic == 1
+            else (batch_size, train_model.n_mic, n_samples)
+        )
+        xl = torch.randn(*shape, generator=gen, dtype=dtype).to(device)
+        xr = torch.randn(*shape, generator=gen, dtype=dtype).to(device)
 
         yl_par, yr_par, _ = train_model(xl, xr)
         runner = BinauralStreamingRunner(train_model, step_fn=step_fn)
@@ -457,7 +510,6 @@ def export_torchscript(
     verify: bool = True,
     atol: float = 1e-5,
 ) -> tuple[Path, float | None]:
-    """将训练模型按流式单帧构造并导出为 TorchScript (.pt)。"""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     stream = train_model.build_streaming_model()
@@ -485,7 +537,11 @@ def export_onnx(
     verify: bool = True,
     atol: float = 1e-4,
 ) -> tuple[Path, float | None]:
-    """将训练模型按流式单帧构造并导出为 ONNX (.onnx)。"""
+    try:
+        import onnx  # noqa: F401
+    except ImportError as exc:
+        raise ImportError("导出 ONNX 需要安装 onnx 包（pip install onnx）") from exc
+
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     stream = train_model.build_streaming_model().cpu().eval()
@@ -505,7 +561,6 @@ def export_onnx(
         do_constant_folding=True,
         dynamic_axes=dynamic_axes,
     )
-    # 优先使用传统静态图追踪导出，避免在缺少 onnxscript 的环境下报错。
     try:
         torch.onnx.export(stream, dummy, str(out_path), dynamo=False, **export_kwargs)
     except TypeError:
@@ -518,11 +573,8 @@ def export_onnx(
         except ImportError:
             ort_step = None
         if ort_step is not None:
-            # 校验在 CPU 上进行，与 onnxruntime CPU 执行器保持一致。
             cpu_model = train_model
             if train_model.comp.device.type != "cpu":
-                import copy
-
                 cpu_model = copy.deepcopy(train_model).cpu().eval()
             max_err = verify_streaming_equivalence(
                 cpu_model, step_fn=ort_step, batch_size=batch_size, atol=atol
