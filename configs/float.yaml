@@ -1,0 +1,73 @@
+# 全 64 带浮点零延迟参照（验证架构跨耳信息上限）
+# 严格 7 小节纯字面量配置，可直接用于 BinauralAIBF(cfg)
+
+stft:
+  sample_rate: 16000
+  hop: 80
+  win: 240
+  n_fft: 256
+  synthesis_window_size: null
+bands:
+  n_linear: 32
+  n_tri: 32
+local:
+  n_mic: 1
+message:
+  enabled: true
+  payload: complex
+  bits_ref: 6
+  ref_range_db:
+  - -60
+  - 0
+  phase_band_range:
+  - 125
+  - 1375
+  n_phase_bands: 6
+  mag_band_range:
+  - 1500
+  - 7700
+  n_mag_bands: 7
+  rel_mag_range_db:
+  - -24
+  - 12
+  band_range:
+  - 62.5
+  - 8000.0
+  n_msg_bands: 64
+  bits_mag: 0
+  bits_phase: 0
+  mag_range_db:
+  - -60
+  - 20
+  update_period: 1
+  delay_frames: 0
+  sync_error_us: 0.0
+  header_bits: 32
+crf:
+  use_local_logmag: true
+  use_cross_ipd: true
+  use_cross_ild: true
+  use_frontal_features: true
+  frontal_ild_sigma_db: 6.0
+  use_age_feature: true
+  hidden: 128
+  groups: 2
+  tap_stride: 4
+  age_scale_frames: 20
+  n_taps: 3
+scm:
+  local_frame: delayed
+  instance_norm: true
+mvdr:
+  gain_limit: 2.0
+  use_current_spec: true
+  normalize_current_spec: true
+  current_spec_power: 0.3
+  use_film: true
+  film_dim: 8
+  use_cross_band: true
+  cross_band_kernel: 5
+  cross_band_bottleneck: 16
+  hidden: 48
+  groups: 2
+  n_layers: 2

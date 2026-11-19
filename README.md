@@ -1,13 +1,34 @@
-# 双耳 AIBF 数据探针版本
+# 双耳 AIBF 数据探针与可合入模型包
 
-本版本可直接接入双耳数据，训练并评测两个探针。
-首轮任务为固定正前方拾音，每耳 1 麦。
-左右目标必须保留各自的目标声像。
+本仓库包含两层内容：
+- **位置无关模型包 `binaural_aibf/`**：可直接复制到主仓作为子包挂载，支持 `local.n_mic >= 1`（每耳单麦或多麦）、128 非直流频点（跳过 DC bin 0）、批量损失 `training_loss_batch`、纯函数 `preset` 及单帧 TorchScript / ONNX 导出。
+- **包外工作流与配置**：`config.yaml`（严格 7 小节纯字面量）、`configs/`（4 组对照版本 YAML）、`run.py`、`make_demo.py`、`smoke_test.py`、`test_probe.py`。
 
-本版本是离线实验与流式导出工具。
-训练路径沿时间维全帧并行，避免逐帧反向传播。
-导出路径按单帧流式构造网络，支持 TorchScript 与 ONNX。
+首轮任务为固定正前方定向拾音，左右目标保留各自声像。
 真实无线打包、丢包与硬件调度仍未包含。
+
+## 仓库分层与主仓合入
+
+```text
+binaural_aibf/          # 可直接复制进主仓的模型包（全相对导入，无 hydra/lightning 依赖）
+├── __init__.py         # 导出 BinauralAIBF、CrossEarMessage、BitrateReport、preset
+├── bands.py            # 低频恒等 + 高频功率池化压缩、去直流/补零助手
+├── complexops.py       # 纯实数张量复数运算
+├── data.py             # JSONL + NPZ/WAV 读取与防泄漏检验
+├── features.py         # 跨耳 IPD/ILD、0° 正前方先验、当前帧压缩归一化谱
+├── losses.py           # training_loss_batch([B,2,S])、training_loss([2,S])、binaural_loss
+├── message.py          # complex / logmag / mixed(64-bit 混合载荷) 编码与延迟保持
+├── metrics.py          # 分带增益与 ILD/IPD 误差
+├── model.py            # BinauralAIBF（支持 n_mic >= 1，默认 V1 架构）
+├── modules.py          # CRFEstimator(含通道混洗)、NeuralSCM、MVDRBandEstimator(内置 FiLM/CrossBand)
+├── presets.py          # 纯函数 preset(cfg, name)
+├── stft.py             # CausalSTFT（含可选 synthesis_window_size，仅暴露 9 个冻结接口）
+└── streaming.py        # StreamingSideModel、BinauralStreamingRunner、TorchScript/ONNX 导出
+config.yaml             # 7 小节纯字面量 schema（stft/bands/local/message/crf/scm/mvdr）
+configs/                # local.yaml、float.yaml、s0_default.yaml、v1_mixed.yaml
+run.py                  # 训练、评测与探针矩阵工作流
+test_probe.py           # 包契约、多麦、因果与动态批次导出测试
+```
 
 ## 安装与自检
 
@@ -86,25 +107,29 @@ python run.py validate --train data/train.jsonl --val data/val.jsonl --test data
 
 检查读取全部文件，报告条目数、场景组数和时长。
 
-## 先跑一个模型
+## 先跑一个模型与四版本对比
 
 ```bash
-python run.py train --preset local --train data/train.jsonl --val data/val.jsonl --out runs/local --epochs 20 --segment-seconds 1
-python run.py evaluate --checkpoint runs/local/best.pt --test data/test.jsonl --out runs/local_test
+python run.py train --config configs/v1_mixed.yaml --train data/train.jsonl --val data/val.jsonl --out runs/v1_mixed
+python run.py evaluate --checkpoint runs/v1_mixed/best.pt --test data/test.jsonl --out runs/v1_mixed_test
 ```
 
-第一条训练严格无通信基线。
-第二条用验证集选出的检查点评测测试集。
-输出目录必须尚不存在，防止覆盖旧实验。
+可用 4 个纯 7 小节配置文件直接切换版本（也可用 `--preset` 或 `run.py probe --kind versions` 一键跑完）：
 
-每个训练样本每轮随机裁一段，默认 1 s。
-短样本保留全长，不补齐成批次。
-训练批次固定为一段，左右两耳联合反向传播。
-`--segment-seconds 0` 表示使用整段。
+```bash
+python run.py probe --kind versions --train data/train.jsonl --val data/val.jsonl --test data/test.jsonl --out runs/versions
+```
+
+| 版本 | 配置文件 | 跨耳载荷与码率 | 正前方先验 / FiLM / CrossBand | MVDR hidden |
+|---|---|---|---|---:|
+| `local` | `configs/local.yaml` | 关闭（0 kbps） | 开 / 开 / 开 | 48 |
+| `float` | `configs/float.yaml` | 64 带浮点零延迟（不报码率） | 开 / 开 / 开 | 48 |
+| `s0_default` | `configs/s0_default.yaml` | 125–1000 Hz 8 点 `4+4 bit`（`3.20 kbps/向`） | 关 / 关 / 关 | 64 |
+| `v1_mixed` | `configs/v1_mixed.yaml` | 6 相位(`5b`) + 7 幅度(`4b`) + `6b` 参考（`3.20 kbps/向`） | 开 / 开 / 开 | 48 |
+
+默认训练使用 `batch_size=8`、`segment_seconds=3.0`、`lr_schedule=cosine`、`epochs=20`、`lr=0.001`。
+批内短样本自动右补零对齐；`--segment-seconds 0` 表示使用整段。
 验证和测试始终使用整段音频。
-长音频会增加循环耗时与训练显存。
-
-当前不跨片段保留状态，也不提供断点续训。
 训练会保存 `last.pt` 和 `best.pt`。
 
 ## 探针一：延迟
@@ -149,7 +174,7 @@ python run.py probe --kind bandwidth --train data/train.jsonl --val data/val.jso
 | `magnitude` | 幅度 4 bit，不传相位 | 1.60 kbps | 6.40 kbps |
 | `matched_rate_magnitude` | 幅度 8 bit，不传相位 | 3.20 kbps | 9.60 kbps |
 
-量化档默认选取 0–1 kHz 内 8 个固定模型频带。
+量化档默认跳过直流 bin 0，使用 128 个非直流频点（62.5–8000 Hz）；`complex` 档默认选取 125–1000 Hz 内 8 个固定模型频带。
 除 `slow` 外，每 4 帧更新。链路延迟为 4 帧。
 应用层按每包 32 bit 头部，并把整包向上对齐到字节。
 真实链路层开销、重传与功耗不在此表。
@@ -243,8 +268,9 @@ python run.py export --checkpoint runs/default/best.pt --onnx export/side_step.o
 
 ```bash
 python make_demo.py --out demo_data --seconds 0.2
-python run.py probe --kind delay --delays 0 4 16 --train demo_data/train.jsonl --val demo_data/val.jsonl --test demo_data/test.jsonl --out demo_delay --epochs 1
-python run.py probe --kind bandwidth --train demo_data/train.jsonl --val demo_data/val.jsonl --test demo_data/test.jsonl --out demo_bandwidth --epochs 1
+python run.py probe --kind versions --train demo_data/train.jsonl --val demo_data/val.jsonl --test demo_data/test.jsonl --out demo_versions --epochs 1 --batch-size 2 --segment-seconds 0.2
+python run.py probe --kind delay --delays 0 4 16 --train demo_data/train.jsonl --val demo_data/val.jsonl --test demo_data/test.jsonl --out demo_delay --epochs 1 --batch-size 2 --segment-seconds 0.2
+python run.py probe --kind bandwidth --train demo_data/train.jsonl --val demo_data/val.jsonl --test demo_data/test.jsonl --out demo_bandwidth --epochs 1 --batch-size 2 --segment-seconds 0.2
 ```
 
 演示数据是正弦信号加噪声，只用于检查完整流程。
