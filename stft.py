@@ -66,13 +66,20 @@ class CausalSTFT:
         frames = frames * w
 
         total = (t - 1) * self.hop + self.win
-        out = torch.zeros(b, total, device=spec.device, dtype=frames.dtype)
-        norm = torch.zeros(1, total, device=spec.device, dtype=frames.dtype)
-        wsq = (w ** 2).unsqueeze(0)
-        for i in range(t):
-            lo = i * self.hop
-            out[:, lo : lo + self.win] += frames[:, i]
-            norm[:, lo : lo + self.win] += wsq
+        # 用 fold 向量化 WOLA 叠加，避免在训练反向图中展开 T 个时间步节点。
+        out = torch.nn.functional.fold(
+            frames.transpose(1, 2).contiguous(),
+            output_size=(1, total),
+            kernel_size=(1, self.win),
+            stride=(1, self.hop),
+        ).squeeze(1).squeeze(1)
+        wsq_cols = (w ** 2).view(1, self.win, 1).expand(1, self.win, t).contiguous()
+        norm = torch.nn.functional.fold(
+            wsq_cols,
+            output_size=(1, total),
+            kernel_size=(1, self.win),
+            stride=(1, self.hop),
+        ).squeeze(1).squeeze(1)
         out = out / norm.clamp_min(1e-8)
         out = out[:, self.win - self.hop:]
         if length is not None:

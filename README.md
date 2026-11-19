@@ -4,9 +4,10 @@
 首轮任务为固定正前方拾音，每耳 1 麦。
 左右目标必须保留各自的目标声像。
 
-本版本是离线实验工具。
-每段内按帧递推，段间重置状态。
-尚未提供设备收发、跨调用流式状态和真实无线打包。
+本版本是离线实验与流式导出工具。
+训练路径沿时间维全帧并行，避免逐帧反向传播。
+导出路径按单帧流式构造网络，支持 TorchScript 与 ONNX。
+真实无线打包、丢包与硬件调度仍未包含。
 
 ## 安装与自检
 
@@ -220,6 +221,23 @@ python run.py probe --kind bandwidth --train data/train.jsonl --val data/val.jso
 空目标单独使用按输入能量归一化的输出能量。
 相干度函数已改为先沿时间平均互谱与自谱。
 总训练损失禁用相干度项，避免混淆目标与残余噪声监督。
+
+## 并行训练与单帧流式导出
+
+训练期在 `model.py` 中并行拼接多路延迟抽头与当前帧数据流。
+循环层在 `modules.py` 中改用基于 `nn.GRU` 的 `GroupedGRU`。
+`CausalSTFT.synthesize` 改用 `F.fold` 向量化，左右耳合并进批次维一次前向。
+新版模型可直接加载旧版 `GroupedGRUCell` 检查点。
+
+导出单帧模型时，调用 `model.build_streaming_model()` 或命令行子命令 `export`。
+流式网络 `StreamingSideModel` 位于 `streaming.py`，使用 `GroupedGRUCell` 与显式状态张量。
+
+```bash
+python run.py export --checkpoint runs/default/best.pt --onnx export/side_step.onnx --torchscript export/side_step.pt
+```
+
+导出脚本默认运行并行模型与单帧流式模型的整段波形比对。
+如果省略 `--checkpoint`，脚本按 `--config` 初始化模型并执行结构导出检查。
 
 ## 无真实数据时的流程验收
 

@@ -66,10 +66,11 @@ def band_center_hz(comp: torch.Tensor, bin_hz: float) -> torch.Tensor:
 
 def compress_complex(spec: torch.Tensor, comp: torch.Tensor) -> torch.Tensor:
     """spec [..., n_bins, 2] 到 [..., n_bands, 2]。实部虚部分别线性加权。"""
+    comp_t = comp.transpose(0, 1)
     return torch.stack(
         [
-            torch.einsum("bk,...k->...b", comp, spec[..., 0]),
-            torch.einsum("bk,...k->...b", comp, spec[..., 1]),
+            torch.matmul(spec[..., 0], comp_t),
+            torch.matmul(spec[..., 1], comp_t),
         ],
         dim=-1,
     )
@@ -77,10 +78,11 @@ def compress_complex(spec: torch.Tensor, comp: torch.Tensor) -> torch.Tensor:
 
 def expand_complex(band: torch.Tensor, expa: torch.Tensor) -> torch.Tensor:
     """band [..., n_bands, 2] 到 [..., n_bins, 2]。"""
+    expa_t = expa.transpose(0, 1)
     return torch.stack(
         [
-            torch.einsum("kb,...b->...k", expa, band[..., 0]),
-            torch.einsum("kb,...b->...k", expa, band[..., 1]),
+            torch.matmul(band[..., 0], expa_t),
+            torch.matmul(band[..., 1], expa_t),
         ],
         dim=-1,
     )

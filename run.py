@@ -15,6 +15,12 @@ from data import read_manifest, check_splits, load_example, validate_manifest
 from losses import training_loss
 from metrics import scores, summarize
 from model import BinauralAIBF
+from streaming import (
+    StreamingSideModel,
+    export_onnx,
+    export_torchscript,
+    verify_streaming_equivalence,
+)
 
 HERE = Path(__file__).resolve().parent
 
@@ -164,7 +170,7 @@ def load_checkpoint(path, device):
 def main():
     parser = argparse.ArgumentParser(description='双耳探针实验')
     sub = parser.add_subparsers(dest='command', required=True)
-    for command in ('validate', 'train', 'probe', 'evaluate'):
+    for command in ('validate', 'train', 'probe', 'evaluate', 'export'):
         p = sub.add_parser(command)
         p.add_argument('--config', default=str(HERE / 'config.yaml'))
         p.add_argument('--device', default='cpu')
@@ -174,7 +180,7 @@ def main():
             p.add_argument('--val', required=True)
         if command in ('validate', 'probe', 'evaluate'):
             p.add_argument('--test', required=True)
-        if command != 'validate':
+        if command not in ('validate', 'export'):
             p.add_argument('--out', required=True)
         if command in ('train', 'probe'):
             p.add_argument('--epochs', type=int, default=20)
@@ -189,10 +195,48 @@ def main():
         if command == 'evaluate':
             p.add_argument('--checkpoint', required=True)
             p.add_argument('--delay-frames', type=int, help='仅改推理延迟，属于鲁棒性扫描，不是重训结果')
+        if command == 'export':
+            p.add_argument('--checkpoint', help='训练检查点路径；省略时按 --config 初始化导出结构验证')
+            p.add_argument('--onnx', help='导出单帧流式 ONNX 文件路径')
+            p.add_argument('--torchscript', help='导出单帧流式 TorchScript 文件路径')
+            p.add_argument('--opset', type=int, default=17, help='ONNX opset 版本')
+            p.add_argument('--no-verify', action='store_true', help='跳过导出后并行与流式等价性校验')
     args = parser.parse_args()
     if args.threads < 1:
         parser.error('threads 必须大于零')
     torch.set_num_threads(args.threads)
+    if args.command == 'export':
+        if not args.onnx and not args.torchscript:
+            parser.error('export 至少需要指定 --onnx 或 --torchscript 之一')
+        if args.checkpoint:
+            model, _ = load_checkpoint(args.checkpoint, args.device)
+        else:
+            model = BinauralAIBF(config(args.config)).to(args.device)
+        model.eval()
+        verify = not args.no_verify
+        py_err = verify_streaming_equivalence(model) if verify else None
+        if py_err is not None:
+            print(f'PyTorch 流式单帧校验通过，最大波形误差 {py_err:.2e}', flush=True)
+        if args.torchscript:
+            ts_path, ts_err = export_torchscript(model, args.torchscript, verify=verify)
+            msg = f'TorchScript 已导出：{ts_path}'
+            if ts_err is not None:
+                msg += f'，校验最大误差 {ts_err:.2e}'
+            print(msg, flush=True)
+        if args.onnx:
+            onnx_path, onnx_err = export_onnx(
+                model, args.onnx, opset_version=args.opset, verify=verify
+            )
+            msg = f'ONNX 已导出：{onnx_path}'
+            if onnx_err is not None:
+                msg += f'，onnxruntime 校验最大误差 {onnx_err:.2e}'
+            print(msg, flush=True)
+        print(
+            f'单帧输入：{list(StreamingSideModel.INPUT_NAMES)}\n'
+            f'单帧输出：{list(StreamingSideModel.OUTPUT_NAMES)}',
+            flush=True,
+        )
+        return
     cfg = config(args.config)
     if args.command in ('train', 'probe') and (args.epochs < 1 or args.segment_seconds < 0 or args.lr <= 0):
         parser.error('epochs 与 lr 必须大于零，segment-seconds 不得为负')

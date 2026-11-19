@@ -194,3 +194,10 @@ class CrossEarMessage:
         valid = valid_t.float().view(1, t, 1).expand(b, t, 1)
         received = received * valid.unsqueeze(-1)
         return received, emit_clamped, valid, age, decoded_all
+
+    def encode_decode_step(self, band_spec_frame: torch.Tensor) -> torch.Tensor:
+        """单帧流式消息编解码。[B, n_bands, 2] -> [B, n_bands, 2]。"""
+        x = band_spec_frame.unsqueeze(1)
+        spec = self._apply_sync_error(x, self.band_centers)
+        msg = self._encode(spec)
+        return self._decode(msg, band_spec_frame.device).squeeze(1)

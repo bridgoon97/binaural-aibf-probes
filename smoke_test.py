@@ -114,6 +114,15 @@ def test_causality(cfg):
     assert d_after > 1e-4, "扰动没有传播，这个测试本身无效"
 
 
+def test_streaming_equivalence(cfg):
+    """验证全帧并行模型与单帧流式构造网络的整段波形等价性。"""
+    from streaming import verify_streaming_equivalence
+
+    m = BinauralAIBF(cfg).eval()
+    max_err = verify_streaming_equivalence(m, seconds=0.2, batch_size=1, atol=1e-5)
+    print(f"[流式] 并行训练与单帧流式波形最大差 {max_err:.2e}")
+
+
 def test_sweeps(cfg):
     print("\n[实验一] 延迟扫描，其余字段固定")
     for d in [0, 1, 2, 4, 8, 16]:
@@ -162,5 +171,7 @@ if __name__ == "__main__":
     test_model(cfg)
     print()
     test_causality(cfg)
+    print()
+    test_streaming_equivalence(cfg)
     test_sweeps(cfg)
     print("\n全部自检通过")

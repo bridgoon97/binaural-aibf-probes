@@ -90,6 +90,54 @@ def build_crf_input(
     return feat
 
 
+def build_crf_input_step(
+    cfg: dict,
+    local_band_now: torch.Tensor,
+    local_band_matched: torch.Tensor,
+    remote_band: torch.Tensor,
+    valid: torch.Tensor,
+    age_frames: torch.Tensor,
+    valid_band: torch.Tensor,
+) -> torch.Tensor:
+    """拼出单帧流式推理的 CRF 输入向量 [B, D]。
+
+    local_band_now      [B, n_bands, 2] 当前帧本侧频带谱
+    local_band_matched  [B, n_bands, 2] 与对耳消息同时间戳的本侧频带谱
+    remote_band         [B, n_bands, 2] 接收侧当前持有的对耳频带谱
+    valid               [B, 1] 是否已收到任何消息
+    age_frames          [B, 1] 当前消息年龄（单位帧）
+    valid_band          [n_bands] 哪些频带有对耳信息
+    """
+    c = cfg["crf"]
+    parts = []
+
+    if c["use_local_logmag"]:
+        parts.append(log_mag(local_band_now))
+
+    vb = valid_band.to(device=local_band_now.device, dtype=local_band_now.dtype).unsqueeze(0)
+    gate = vb * valid  # [B, n_bands]
+
+    if c["use_cross_ipd"]:
+        cos_ipd, sin_ipd = cross_ipd(local_band_matched, remote_band)
+        if cfg["message"]["payload"] == "logmag":
+            cos_ipd = torch.zeros_like(cos_ipd)
+            sin_ipd = torch.zeros_like(sin_ipd)
+        parts.append(cos_ipd * gate)
+        parts.append(sin_ipd * gate)
+
+    if c["use_cross_ild"]:
+        parts.append(cross_ild(local_band_matched, remote_band) * gate)
+
+    feat = torch.cat(parts, dim=-1)
+
+    if c["use_age_feature"]:
+        max_age = float(cfg["crf"].get("age_scale_frames", 20))
+        age = age_frames.to(dtype=local_band_now.dtype) / max_age
+        feat = torch.cat([feat, age, valid.to(dtype=local_band_now.dtype)], dim=-1)
+
+    return feat
+
+
 def crf_input_dim(cfg: dict, n_bands: int) -> int:
     c = cfg["crf"]
     d = 0
